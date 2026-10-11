@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react"
 import { Pause, Play } from "lucide-react"
+import { RADAR_COAST, RADAR_PLACES, radarPin } from "@/lib/weather/radar-coast"
 import type { RadarView } from "@/lib/weather/types"
 
 function startRange(radar: RadarView): number {
@@ -9,7 +10,7 @@ function startRange(radar: RadarView): number {
   return holding >= 0 ? holding : 0
 }
 
-export function RadarPanel({ radar }: { radar: RadarView }) {
+export function RadarPanel({ radar, placeName }: { radar: RadarView; placeName: string }) {
   const [which, setWhich] = useState(() => startRange(radar))
   const range = radar.ranges[which] ?? radar.ranges[0]
   const [index, setIndex] = useState(Math.max(0, (range?.frames.length ?? 1) - 1))
@@ -54,6 +55,17 @@ export function RadarPanel({ radar }: { radar: RadarView }) {
 
   const frame = range.frames[index] ?? range.frames[range.frames.length - 1]
   const pixel = range.km === 64 ? "a quarter of a kilometre" : "half a kilometre"
+  const coast = RADAR_COAST[range.code]
+  const places = RADAR_PLACES.flatMap((place) => {
+    const pin = radarPin(place.lat, place.lon, range.km)
+    if (!pin) return []
+    if (place.name === placeName) return []
+    if (range.pinLeft != null && range.pinTop != null) {
+      const near = Math.hypot(pin.left - range.pinLeft, pin.top - range.pinTop)
+      if (near < 7) return []
+    }
+    return [{ ...place, ...pin }]
+  })
 
   return (
     <div>
@@ -73,12 +85,22 @@ export function RadarPanel({ radar }: { radar: RadarView }) {
         ))}
       </div>
       <div className="relative mt-3 aspect-square overflow-hidden rounded-xl bg-surface">
-        <img
-          src={range.map}
-          alt=""
-          className="absolute inset-0 h-full w-full"
-          style={{ filter: "brightness(0.22) contrast(1.6) saturate(0.55)" }}
-        />
+        {coast ? (
+          <svg
+            viewBox="0 0 512 512"
+            className="absolute inset-0 h-full w-full text-muted"
+            aria-hidden="true"
+          >
+            <path
+              d={coast}
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+          </svg>
+        ) : null}
         <img src={range.rings} alt="" className="absolute inset-0 h-full w-full" />
         {range.frames.map((item, itemIndex) => (
           <img
@@ -89,12 +111,36 @@ export function RadarPanel({ radar }: { radar: RadarView }) {
             className={`absolute inset-0 h-full w-full ${itemIndex === index ? "" : "invisible"}`}
           />
         ))}
+        {places.map((place) => (
+          <span
+            key={place.name}
+            className="pointer-events-none absolute z-10"
+            style={{ left: `${place.left}%`, top: `${place.top}%` }}
+          >
+            <span className="absolute size-1.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-muted" />
+            <span
+              className={`absolute top-1/2 -translate-y-1/2 whitespace-nowrap text-[11px] leading-none text-muted [text-shadow:0_0_4px_#10140f,0_1px_2px_#10140f] ${
+                place.left > 72 ? "right-2 text-right" : "left-2"
+              }`}
+            >
+              {place.name}
+            </span>
+          </span>
+        ))}
         {range.pinLeft != null && range.pinTop != null ? (
           <span
-            className="absolute z-10 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-bg bg-accent"
+            className="pointer-events-none absolute z-20"
             style={{ left: `${range.pinLeft}%`, top: `${range.pinTop}%` }}
-            aria-hidden="true"
-          />
+          >
+            <span className="absolute size-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-bg bg-accent" />
+            <span
+              className={`absolute left-1/2 -translate-x-1/2 whitespace-nowrap text-[11px] leading-none text-fg [text-shadow:0_0_4px_#10140f,0_1px_2px_#10140f] ${
+                range.pinTop > 88 ? "bottom-3" : "top-3"
+              }`}
+            >
+              {placeName}
+            </span>
+          </span>
         ) : null}
       </div>
       <div className="mt-3 flex items-center gap-3">
@@ -125,7 +171,7 @@ export function RadarPanel({ radar }: { radar: RadarView }) {
         Bureau of Meteorology, {radar.site}. Native {range.km} km picture, {pixel} per pixel.
         {range.pinLeft == null
           ? " This place is outside the ring."
-          : " The dot is this place."}
+          : " The dot is this place, on the Bureau shoreline."}
         {radar.clutter ? " This close to the dish, the beam is low and the ridge can clutter the echo." : ""}{" "}
         Echoes are rain, not cloud.
       </p>

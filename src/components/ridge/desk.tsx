@@ -465,7 +465,7 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
         </Section>
 
         <Section kicker="Radar">
-          <RadarPanel radar={f.radar} />
+          <RadarPanel radar={f.radar} placeName={f.placeName} />
         </Section>
 
         {f.scorecard ? (

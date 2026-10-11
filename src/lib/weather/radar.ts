@@ -1,7 +1,7 @@
 import type { RadarRange, RadarView } from "./types"
+import { radarDistanceKm, radarPin } from "./radar-coast"
 
-const SITE = { name: "Sydney (Terrey Hills)", lat: -33.701, lon: 151.21 }
-const KM_PER_DEG = 111.11
+const SITE = { name: "Sydney (Terrey Hills)" }
 const LOOP_HOST = "https://reg.bom.gov.au"
 const ASSET_HOST = "https://www.bom.gov.au"
 
@@ -9,22 +9,6 @@ const PRODUCTS = [
   { km: 64, code: "IDR714" },
   { km: 128, code: "IDR713" },
 ] as const
-
-function kmBetween(lat: number, lon: number): number {
-  const north = (lat - SITE.lat) * KM_PER_DEG
-  const east = (lon - SITE.lon) * KM_PER_DEG * Math.cos((SITE.lat * Math.PI) / 180)
-  return Math.hypot(north, east)
-}
-
-function pinFor(lat: number, lon: number, km: number): { left: number; top: number } | null {
-  const north = (lat - SITE.lat) * KM_PER_DEG
-  const east = (lon - SITE.lon) * KM_PER_DEG * Math.cos((SITE.lat * Math.PI) / 180)
-  const scale = km / 256
-  const x = 256 + east / scale
-  const y = 256 - north / scale
-  if ((x - 256) ** 2 + (y - 256) ** 2 > 256 ** 2) return null
-  return { left: (x / 512) * 100, top: (y / 512) * 100 }
-}
 
 function frameLabel(path: string): string {
   const match = path.match(/(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})\.png$/)
@@ -62,7 +46,7 @@ async function loadRange(
     }),
   )
   if (!frames.length) return null
-  const pin = pinFor(lat, lon, product.km)
+  const pin = radarPin(lat, lon, product.km)
   return {
     km: product.km,
     code: product.code,
@@ -79,7 +63,7 @@ export async function loadRadar(lat: number, lon: number): Promise<RadarView> {
   const loaded = await Promise.all(PRODUCTS.map((product) => loadRange(product, lat, lon).catch(() => null)))
   return {
     site: SITE.name,
-    clutter: kmBetween(lat, lon) < 18,
+    clutter: radarDistanceKm(lat, lon) < 18,
     ranges: loaded.filter((range): range is RadarRange => range != null),
   }
 }
