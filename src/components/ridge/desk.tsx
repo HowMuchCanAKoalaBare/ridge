@@ -108,7 +108,10 @@ function DayRow({ day }: { day: DayPoint }) {
             {mm(day.p10)} to {mm(day.p90)}. Chance of 5 mm {pct(day.pop5)}.
           </p>
         ) : null}
-        {day.seaBreeze ? <p className="mt-1">Afternoon wind is onshore. Not applied to the storm score.</p> : null}
+        {day.seaBreeze ? (
+          <p className="mt-1">Afternoon wind is onshore. Reported, not a penalty.</p>
+        ) : null}
+        {day.cape != null ? <p className="mt-1">Afternoon CAPE {Math.round(day.cape)} J/kg.</p> : null}
         {day.outlier ? <p className="mt-1 text-fg">{day.outlier}</p> : null}
         <ul className="mt-3 space-y-1">
           {day.models.map((model) => (
@@ -185,6 +188,9 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
             <p className="mt-1 text-xs text-muted">
               {f.elevation} m · {f.admin} · {f.liveModels} of {f.askedModels} models · {f.updatedLabel}
             </p>
+            {f.runs.length ? (
+              <p className="mt-1 text-xs text-muted">{f.runs.map((run) => run.label).join(" · ")}</p>
+            ) : null}
           </div>
           <button
             type="button"
@@ -286,6 +292,11 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
               {f.now.mean != null && f.now.temp != null && Math.abs(f.now.mean - f.now.temp) >= 0.6 ? (
                 <p className="text-sm text-muted">Mean {f.now.mean.toFixed(1)}°, pulled by the tail</p>
               ) : null}
+              {f.centreTemp != null && f.centreCount > 1 ? (
+                <p className="text-sm text-muted">
+                  Centre median {Math.round(f.centreTemp)}°, one vote across {f.centreCount} centres
+                </p>
+              ) : null}
             </div>
           </div>
           <p className="mt-3 text-sm leading-relaxed text-muted">
@@ -315,6 +326,34 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
           </div>
         </Section>
 
+        <Section kicker="Stations">
+          {f.observations.length ? (
+            <div className={f.observations.length > 2 ? "grid grid-cols-3 gap-2" : "grid grid-cols-2 gap-2"}>
+              {f.observations.map((station) => (
+                <article key={`${station.role}-${station.id}`} className="rounded-xl bg-surface p-3">
+                  <p className="text-xs tracking-widest text-muted uppercase">{station.role}</p>
+                  <p className="mt-2 font-serif text-2xl text-fg">
+                    {station.temp == null ? "–" : Math.round(station.temp)}°
+                  </p>
+                  <p className="truncate text-xs text-fg">{station.name}</p>
+                  <p className="mt-2 text-xs text-muted">{station.windText ?? "–"}</p>
+                  <p className="text-xs text-muted">
+                    {station.change == null
+                      ? "No hour change"
+                      : `${station.change > 0 ? "+" : ""}${station.change.toFixed(1)}° last hour`}
+                  </p>
+                  <p className="text-xs text-muted">
+                    {station.when}
+                    {station.distanceKm != null ? ` · ${station.distanceKm} km` : ""}
+                    {station.elevation != null ? ` · ${Math.round(station.elevation)} m` : ""}
+                  </p>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          {f.obsNote ? <p className="mt-2 text-xs text-muted">{f.obsNote}</p> : null}
+        </Section>
+
         <Section kicker="Next 36 hours">
           <div className="scroller -mx-4 flex gap-2 overflow-x-auto px-4 pb-2">
             {f.hourly.map((hour) => (
@@ -332,7 +371,9 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
             ))}
           </div>
           <p className="mt-2 text-xs text-muted">
-            A percent on an hour is how many models are wet then. The ensemble chance is on each day.
+            {f.hourlyFrom === "ensemble"
+              ? "A percent on an hour is the ensemble chance of at least 1 mm that hour, one vote per ensemble. Under 15% shows a dot. That is a heavier bar than a light shower."
+              : "Hourly ensembles did not load. A percent is how many models reach at least 1 mm that hour. The day still uses ensembles when they answered."}
           </p>
         </Section>
 
@@ -392,39 +433,78 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
           </p>
         </Section>
 
-        <Section kicker="Storm desk">
+        <Section kicker="Storm ingredients">
           <div className="rounded-xl bg-surface p-4">
-            <div className="flex items-end justify-between gap-3">
+            <p className="text-sm text-accent">{f.storm.day}</p>
+            <div className="mt-3 grid grid-cols-3 gap-2">
               <div>
-                <p className="font-serif text-4xl text-fg">{f.storm.score}</p>
-                <p className="text-sm text-accent">
-                  {f.storm.label} · {f.storm.day}
+                <p className="text-xs tracking-widest text-muted uppercase">CAPE</p>
+                <p className="mt-1 font-serif text-3xl text-fg">
+                  {f.storm.cape == null ? "–" : Math.round(f.storm.cape)}
                 </p>
+                <p className="text-xs text-muted">J/kg</p>
               </div>
-              <p className="text-right text-sm text-muted">
-                CAPE {f.storm.cape == null ? "–" : Math.round(f.storm.cape)}
-                <br />
-                {f.storm.seaBreeze ? "Onshore afternoon" : "Not onshore"}
-              </p>
+              <div>
+                <p className="text-xs tracking-widest text-muted uppercase">1 mm</p>
+                <p className="mt-1 font-serif text-3xl text-rain">{pct(f.storm.pop)}</p>
+                <p className="text-xs text-muted">ensemble</p>
+              </div>
+              <div>
+                <p className="text-xs tracking-widest text-muted uppercase">Gust</p>
+                <p className="mt-1 font-serif text-3xl text-fg">
+                  {f.storm.gust == null ? "–" : Math.round(f.storm.gust)}
+                </p>
+                <p className="text-xs text-muted">km/h</p>
+              </div>
             </div>
-            <div className="mt-3 h-2 rounded-full bg-surface-2">
-              <div className="h-2 rounded-full bg-accent" style={{ width: `${f.storm.score}%` }} />
-            </div>
+            <p className="mt-3 text-sm text-muted">
+              {f.storm.seaBreeze ? "Onshore afternoon" : "Not a sustained onshore wind"}
+            </p>
             <p className="mt-3 text-sm leading-relaxed text-fg">{f.storm.detail}</p>
           </div>
         </Section>
 
         <Section kicker="Radar">
-          <RadarPanel frames={f.radar.frames} pinLeft={f.radar.pinLeft} pinTop={f.radar.pinTop} />
-          <a
-            className="mt-3 inline-flex min-h-11 items-center text-sm text-accent"
-            href="https://www.bom.gov.au/products/IDR713.loop.shtml"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Bureau Sydney radar loop
-          </a>
+          <RadarPanel radar={f.radar} />
         </Section>
+
+        {f.scorecard ? (
+          <Section kicker="Scorecard">
+            <div className="rounded-xl bg-surface p-4">
+              <p className="text-sm text-fg">
+                {f.scorecard.mae == null ? "No closed hours yet" : `MAE ${f.scorecard.mae.toFixed(1)}°`}
+                <span className="text-muted">
+                  {" "}
+                  · {f.scorecard.count} {f.scorecard.count === 1 ? "hour" : "hours"} · {f.scorecard.station}
+                </span>
+              </p>
+              <p className="mt-1 text-xs text-muted">{f.scorecard.note}</p>
+              {f.scorecard.rows.length ? (
+                <ul className="mt-3 space-y-2">
+                  {f.scorecard.rows.map((row) => (
+                    <li key={row.hourKey} className="flex items-baseline justify-between gap-3 text-sm">
+                      <span className="text-muted">{row.label}</span>
+                      <span className="text-fg">
+                        {round(row.median)}° vs {round(row.obs)}°
+                        {row.error == null ? null : (
+                          <span className="text-muted">
+                            {" "}
+                            {row.error > 0 ? "+" : ""}
+                            {row.error.toFixed(1)}
+                          </span>
+                        )}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-3 text-sm text-muted">
+                  The first median for each hour is kept. It is scored after that hour, against the station.
+                </p>
+              )}
+            </div>
+          </Section>
+        ) : null}
 
         <Section kicker="Fire and air">
           <div className="grid gap-2 sm:grid-cols-2">
@@ -456,19 +536,32 @@ export function Desk({ initial, place }: { initial: Forecast; place: Place }) {
             <p>
               Thirteen global datasets are requested, and every one that answers gets the same vote: ECMWF IFS, AIFS,
               NOAA AIGFS, GraphCast, GFS, ICON, UKMO, GEM, ARPEGE, JMA, ACCESS-G, GRAPES and KMA. No hand weights. A
-              model that disagrees stays in. The big number is the median. The mean is there so you can see when a tail
-              pulls it. Seamless blends and “best match” are not used — those are already someone else’s merge.
-              Temperature uses the elevation of the place, not a nearby valley floor.
+              model that disagrees stays in. The big number is the median of every live run. The centre median gives
+              each modelling centre one vote, so three NOAA runs cannot outweigh the Bureau. The mean is there so you
+              can see when a tail pulls it. Seamless blends and “best match” are not used — those are already someone
+              else’s merge. Temperature uses the elevation of the place, not a nearby valley floor.
             </p>
             {f.accessNote ? <p className="text-fg">{f.accessNote}</p> : null}
             <p>
-              Rain chance is the average of each ensemble’s own probability — IFS, AIFS, GEFS, ICON, GEM and ACCESS-GE
-              — so a 51-member set cannot outvote a smaller one. The wet tail is the wettest ensemble’s 1-in-10, not an
-              average that hides it.
+              Rain chance for a day is the average of each ensemble’s own probability of at least 1 mm — IFS, AIFS,
+              GEFS, ICON, GEM and ACCESS-GE — so a 51-member set cannot outvote a smaller one. The same 1 mm line is
+              used on each hour, one vote per ensemble. If the hourly ensemble is missing, the hour falls back to how
+              many deterministic models reach 1 mm, and the caption says so. The wet tail is the wettest ensemble’s
+              1-in-10, not an average that hides it.
             </p>
             <p>
-              The storm score is only CAPE, that rain chance, and gusts. An onshore wind is shown. It is not used to
-              talk the score down.
+              Storm weather is three ingredients on the day with the highest afternoon CAPE in the next five days:
+              that CAPE, the ensemble chance of 1 mm, and the median gust. There is no 0–99 score. An onshore wind is
+              shown. It is not a penalty.
+            </p>
+            <p>
+              Station cards are public METARs. None of them sits on the Berowra ridge. The scorecard keeps the first
+              hourly median this desk issued, then compares it with the nearest station once that hour has a
+              temperature. The difference is the median minus the station.
+            </p>
+            <p>
+              Fire dryness prefers ERA5 reanalysis and says so. It is not a raingauge. If reanalysis fails, IFS past
+              days are used and labelled.
             </p>
             <p>
               This is not a Bureau of Meteorology warning service. If a warning is out, the warning wins.

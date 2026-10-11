@@ -29,6 +29,12 @@ export function median(values: Num[]): number | null {
   return quantile(finite(values), 0.5)
 }
 
+/** Median of each centre, then the median of those. Empty centres are skipped. */
+export function centreMedian(groups: number[][]): number | null {
+  const centres = groups.map((group) => median(group)).filter((v): v is number => v != null)
+  return median(centres)
+}
+
 /** Open-Meteo ensemble keys: field, field_member01, or field_member01_system. */
 export function ensembleSystemId(field: string, key: string): string | null {
   if (key !== field && !key.startsWith(`${field}_`)) return null
@@ -99,8 +105,9 @@ export function conditionLabel(code: number | null): string {
   return "Unsettled"
 }
 
-export function summaryFor(pop: number | null, rain: number | null, code: number | null, storm: number): string {
-  if (storm >= 55 || (code != null && code >= 95)) return "Storm risk"
+export function summaryFor(pop: number | null, rain: number | null, code: number | null, cape: number | null): string {
+  if (code != null && code >= 95) return "Thunderstorms"
+  if ((cape ?? 0) >= 1000 && (pop ?? 0) >= 0.3) return "Storm ingredients"
   if ((pop != null && pop >= 0.6) || (rain != null && rain >= 8)) return "Rain likely"
   if ((pop != null && pop >= 0.3) || (rain != null && rain >= 1)) return "Shower risk"
   if (code != null && code >= 45 && code < 51) return "Fog"
@@ -137,28 +144,6 @@ export function outlierNote(models: DayModel[]): string | null {
   return null
 }
 
-export function stormLabel(score: number): string {
-  if (score < 15) return "Quiet"
-  if (score < 35) return "Isolated"
-  if (score < 55) return "Possible"
-  if (score < 75) return "Storms likely"
-  return "Significant"
-}
-
-export function stormScore(opts: {
-  cape: number | null
-  pop: number | null
-  gust: number | null
-}): number {
-  let score = 0
-  const cape = opts.cape ?? 0
-  if (cape > 100) score += Math.min(42, cape / 38)
-  if (opts.pop != null) score += opts.pop * 42
-  if ((opts.gust ?? 0) >= 45) score += 8
-  return Math.max(0, Math.min(99, Math.round(score)))
-}
-
-/** McArthur FFDI. Drought factor is a 14-day rainfall proxy, not the Bureau's official dryness. */
 export function ffdi(temp: number, rh: number, windKmh: number, drought: number): number {
   const df = Math.min(10, Math.max(1, drought))
   const rhC = Math.min(100, Math.max(1, rh))
@@ -268,6 +253,8 @@ export function writeBrief(input: {
   ridge: boolean
   temp: number | null
   mean: number | null
+  centre: number | null
+  centres: number
   lo: number | null
   hi: number | null
   live: number
@@ -280,11 +267,11 @@ export function writeBrief(input: {
   ensembleNames: string
   ahead: number | null
   outlier: string | null
-  stormLabel: string
-  stormScore: number
   stormDay: string
+  stormPop: number | null
   seaBreeze: boolean
   cape: number | null
+  gust: number | null
   spread: number | null
   spreadWhen: string
 }): string {
@@ -297,8 +284,14 @@ export function writeBrief(input: {
         : input.mean != null
           ? ` Mean ${input.mean.toFixed(1)}° sits on the median.`
           : ""
+    const centre =
+      input.centre != null && input.centres > 1 && Math.abs(input.centre - input.temp) >= 1
+        ? ` Centre median ${Math.round(input.centre)}°, one vote for each of ${input.centres} centres.`
+        : input.centre != null && input.centres > 1
+          ? ` Centre median ${Math.round(input.centre)}° across ${input.centres} centres, within a degree of the all-model median.`
+          : ""
     bits.push(
-      `This hour ${where}, ${input.live} models each have one vote and none were dropped. Median ${Math.round(input.temp)}°, full range ${Math.round(input.lo)}–${Math.round(input.hi)}°.${pull}`,
+      `This hour ${where}, ${input.live} models each have one vote and none were dropped. Median ${Math.round(input.temp)}°, full range ${Math.round(input.lo)}–${Math.round(input.hi)}°.${pull}${centre}`,
     )
   }
 
@@ -329,10 +322,12 @@ export function writeBrief(input: {
 
   if (input.cape != null) {
     const breeze = input.seaBreeze
-      ? " Afternoon wind is onshore. That is reported, and it is not used to mark the score down."
+      ? " Afternoon wind is onshore. That is reported, and it is not a penalty."
       : ""
+    const rain = input.stormPop != null ? ` Ensemble chance of 1 mm that day is ${pct(input.stormPop)}.` : ""
+    const gust = input.gust != null ? ` Median gust ${Math.round(input.gust)} km/h.` : ""
     bits.push(
-      `${input.stormDay} is the highest raw storm signal (${input.stormLabel.toLowerCase()}, ${input.stormScore}). It is only CAPE near ${Math.round(input.cape)} J/kg, the rain chance, and gusts.${breeze}`,
+      `${input.stormDay} has the highest afternoon CAPE in the next five days, near ${Math.round(input.cape)} J/kg.${rain}${gust}${breeze}`,
     )
   }
 

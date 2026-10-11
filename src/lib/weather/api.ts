@@ -1,9 +1,12 @@
 import { createServerFn } from "@tanstack/react-start"
 import { ENSEMBLE_LABEL, ENSEMBLE_PARAM, MODELS, MODEL_PARAM } from "./models"
+import { loadStations } from "./observations"
+import { loadRadar } from "./radar"
 import { BEROWRA, near, onTheRidge, RICHMOND, SYDNEY, trioFor, type Place } from "./places"
 import {
   aqiLabel,
   average,
+  centreMedian,
   circMean,
   clock,
   conditionLabel,
@@ -23,8 +26,6 @@ import {
   prettyUpdated,
   quantile,
   spreadOf,
-  stormLabel,
-  stormScore,
   summaryFor,
   sydneyStamp,
   weekdayOf,
@@ -40,8 +41,10 @@ import type {
   ForecastResult,
   HourPoint,
   ModelNow,
-  RadarFrame,
+  ModelRun,
+  Scorecard,
   SearchHit,
+  StationObs,
 } from "./types"
 
 type Cell = number | string | null
@@ -51,6 +54,17 @@ type Loc = { hourly?: Block; daily?: Block }
 const cache = new Map<string, { at: number; value: ForecastResult }>()
 const inflight = new Map<string, Promise<ForecastResult>>()
 const TTL = 8 * 60 * 1000
+
+type PastRain = {
+  rain14: number | null
+  source: "era5" | "ifs" | "none"
+  days: number
+  through: string | null
+}
+
+type IssuedHour = { hourKey: string; median: number | null; centre: number | null }
+
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
 const HOURLY = [
   "temperature_2m",
@@ -189,46 +203,6 @@ function hoursMatching(times: string[], date: string, from: number, to: number):
   return out
 }
 
-function webMercator(lat: number, lon: number, zoom: number) {
-  const n = 2 ** zoom
-  const x = ((lon + 180) / 360) * n
-  const rad = (lat * Math.PI) / 180
-  const y = (1 - Math.log(Math.tan(rad) + 1 / Math.cos(rad)) / Math.PI) / 2 * n
-  return { x, y, cx: Math.floor(x), cy: Math.floor(y) }
-}
-
-async function radarFor(lat: number, lon: number): Promise<Forecast["radar"]> {
-  const zoom = 10
-  const pos = webMercator(lat, lon, zoom)
-  const coords: Array<{ x: number; y: number }> = []
-  for (let dy = -1; dy <= 1; dy++) {
-    for (let dx = -1; dx <= 1; dx++) coords.push({ x: pos.cx + dx, y: pos.cy + dy })
-  }
-  const pinLeft = ((1 + (pos.x - pos.cx)) / 3) * 100
-  const pinTop = ((1 + (pos.y - pos.cy)) / 3) * 100
-  const base = coords.map((c) => `https://basemaps.cartocdn.com/dark_all/${zoom}/${c.x}/${c.y}.png`)
-  try {
-    const body = (await fetchJson("https://api.rainviewer.com/public/weather-maps.json")) as {
-      host?: string
-      radar?: { past?: Array<{ time: number; path: string }> }
-    }
-    const host = body.host ?? "https://tilecache.rainviewer.com"
-    const past = body.radar?.past ?? []
-    const frames: RadarFrame[] = past.slice(-8).map((frame) => ({
-      label: new Intl.DateTimeFormat("en-AU", {
-        timeZone: "Australia/Sydney",
-        hour: "numeric",
-        minute: "2-digit",
-      }).format(new Date(frame.time * 1000)),
-      base,
-      radar: coords.map((c) => `${host}${frame.path}/256/${zoom}/${c.x}/${c.y}/2/1_1.png`),
-    }))
-    return { frames, pinLeft, pinTop }
-  } catch {
-    return { frames: [], pinLeft, pinTop }
-  }
-}
-
 function gradientText(placeName: string, ridge: boolean, cards: AnchorCard[]): string {
   const sel = cards[0]
   const plain = cards.find((c) => c.role === "The plain")
@@ -257,10 +231,13 @@ function assemble(
   place: Place,
   locs: Loc[],
   ensembleBody: unknown,
-  pastBody: unknown,
+  past: PastRain,
   airBody: unknown,
   radar: Forecast["radar"],
-): Forecast {
+  runs: ModelRun[],
+  observations: StationObs[],
+  obsNote: string | null,
+): { forecast: Forecast; issued: IssuedHour[] } {
   const primary = locs[0]
   const hourly = primary?.hourly
   const daily = primary?.daily
@@ -313,18 +290,41 @@ function assemble(
     return best
   }
 
-  const ens = (ensembleBody ?? {}) as { daily?: Block }
+  const ens = (ensembleBody ?? {}) as { daily?: Block; hourly?: Block }
   const ensDayRain = ensembleSystems(ens.daily, "precipitation_sum")
   const ensDayMax = ensembleSystems(ens.daily, "temperature_2m_max")
   const ensDayIndex = new Map(ensDayRain.times.map((t, i) => [t, i]))
+  const ensHourRain = ensembleSystems(ens.hourly, "precipitation")
+  const ensHourIndex = new Map<string, number>()
+  ensHourRain.times.forEach((t, i) => {
+    ensHourIndex.set(t, i)
+    ensHourIndex.set(t.slice(0, 16), i)
+  })
 
   function systemsAt(pack: { systems: EnsSystem[] }, index: number | undefined): EnsSystem[] {
     if (index == null) return []
     return pack.systems.filter((sys) => column(sys.cols, index).length >= 3)
   }
 
+  function ensembleHourPop(time: string): number | null {
+    const ei = ensHourIndex.get(time) ?? ensHourIndex.get(time.slice(0, 16))
+    const systems = systemsAt(ensHourRain, ei)
+    if (!systems.length) return null
+    const votes: number[] = []
+    for (const sys of systems) {
+      const p = fraction(column(sys.cols, ei as number), (v) => v >= 1)
+      if (p != null) votes.push(p)
+    }
+    return average(votes)
+  }
+
+  const hourlyFrom: "ensemble" | "models" = times.slice(nowI, nowI + 36).some((t) => ensembleHourPop(t) != null)
+    ? "ensemble"
+    : "models"
+
   const hourlyOut: HourPoint[] = []
   const fan: FanPoint[] = []
+  const issued: IssuedHour[] = []
   for (let i = nowI; i < Math.min(times.length, nowI + 36); i++) {
     const time = times[i] ?? ""
     const hour = Number(time.slice(11, 13))
@@ -332,6 +332,15 @@ function assemble(
     const mid = median(temps)
     const avg = average(temps)
     const rainVotes = valuesAt("precipitation", i)
+    const windDir = blendDir(i)
+    const byCentre = new Map<string, number[]>()
+    for (const model of active) {
+      const t = at(tempByModel.get(model.id) ?? null, i)
+      if (t == null) continue
+      const list = byCentre.get(model.centre) ?? []
+      list.push(t)
+      byCentre.set(model.centre, list)
+    }
     const { weekday } = weekdayOf(time.slice(0, 10))
     const showDay = i === nowI || hour === 0
     hourlyOut.push({
@@ -341,16 +350,21 @@ function assemble(
       temp: mid,
       apparent: blend("apparent_temperature", i),
       rain: median(rainVotes),
-      pop: fraction(rainVotes, (v) => v >= 0.2),
+      pop: hourlyFrom === "ensemble" ? ensembleHourPop(time) : fraction(rainVotes, (v) => v >= 1),
       wind: blend("wind_speed_10m", i),
       gust: blend("wind_gusts_10m", i),
-      dir: blendDir(i),
-      dirText: dirText(blendDir(i)),
+      dir: windDir,
+      dirText: dirText(windDir),
       rh: blend("relative_humidity_2m", i),
       cloud: blend("cloud_cover", i),
       cape: blend("cape", i),
       uv: blend("uv_index", i),
       code: majorityCode(i),
+    })
+    issued.push({
+      hourKey: time.slice(0, 16),
+      median: mid,
+      centre: centreMedian([...byCentre.values()]),
     })
     if (mid != null && avg != null && temps.length) {
       fan.push({
@@ -377,7 +391,6 @@ function assemble(
     const stormWindow = hoursMatching(times, date, 12, 19)
     let seaHours = 0
     let peakCape: number | null = null
-    let peakGust: number | null = null
     for (const i of afternoon) {
       const dir = blendDir(i)
       const wind = blend("wind_speed_10m", i)
@@ -386,8 +399,6 @@ function assemble(
     for (const i of stormWindow) {
       const cape = blend("cape", i)
       if (cape != null) peakCape = peakCape == null ? cape : Math.max(peakCape, cape)
-      const gust = blend("wind_gusts_10m", i)
-      if (gust != null) peakGust = peakGust == null ? gust : Math.max(peakGust, gust)
     }
     const seaBreeze = seaHours >= 3
     const ei = ensDayIndex.get(date)
@@ -424,11 +435,6 @@ function assemble(
     const pop5 = average(pop5Each)
     const p50 = median(rainMids)
     const rainMean = median(models.map((m) => m.rain))
-    const storm = stormScore({
-      cape: peakCape,
-      pop,
-      gust: peakGust,
-    })
     const code = majorityCode(d, daily)
     const { weekday, dayNum } = weekdayOf(date)
     const sunrise = clock(stringAt(daily, "sunrise", d, active))
@@ -454,10 +460,10 @@ function assemble(
       sunset,
       spread: spreadOf(maxes),
       code,
-      summary: summaryFor(pop, p50 ?? rainMean, code, storm),
+      summary: summaryFor(pop, p50 ?? rainMean, code, peakCape),
       outlier: outlierNote(models),
       models,
-      storm,
+      cape: peakCape,
       seaBreeze,
     }
   })
@@ -479,9 +485,24 @@ function assemble(
         ? "Tomorrow's maximum"
         : "The next maximum"
   const peak = days.slice(0, 5).reduce<DayPoint | undefined>((best, day) => {
-    if (!best || day.storm > best.storm) return day
+    if (!best) return day
+    const cape = day.cape ?? -1
+    const bestCape = best.cape ?? -1
+    if (cape > bestCape) return day
+    if (cape === bestCape && (day.pop ?? -1) > (best.pop ?? -1)) return day
     return best
-  }, days[0])
+  }, undefined)
+
+  const byCentre = new Map<string, number[]>()
+  for (const model of active) {
+    const t = at(tempByModel.get(model.id) ?? null, nowI)
+    if (t == null) continue
+    const list = byCentre.get(model.centre) ?? []
+    list.push(t)
+    byCentre.set(model.centre, list)
+  }
+  const centreTemp = centreMedian([...byCentre.values()])
+  const centreCount = byCentre.size
 
   const modelsNow: ModelNow[] = active.map((m) => ({
     id: m.id,
@@ -522,19 +543,7 @@ function assemble(
     }
   })
 
-  const past = pastBody as { daily?: Block } | null
-  const pastTimes = past?.daily?.time ?? []
-  const pastRain = nums(past?.daily, "precipitation_sum")
-  let rain14 = 0
-  let rainKnown = false
-  pastTimes.forEach((date, i) => {
-    if (date >= stamp.dateKey) return
-    const v = pastRain?.[i]
-    if (v == null) return
-    rainKnown = true
-    rain14 += v
-  })
-  const dry = droughtFromRain(rainKnown ? rain14 : null)
+  const dry = droughtFromRain(past.rain14)
   const fireDay = hourNow >= 18 ? (days[1] ?? today) : today
   const fireHour = fireDay ? indexAt(times, `${fireDay.date}T15:00`) : nowI
   const fireTemp = blend("temperature_2m", fireHour)
@@ -545,10 +554,16 @@ function assemble(
       ? ffdi(fireTemp, fireRh, fireWind, dry.df)
       : null
   const fireCat = ffdiValue == null ? "Unknown" : ffdiCategory(ffdiValue)
+  const dryness =
+    past.source === "era5" && past.rain14 != null
+      ? `Dryness uses ERA5 reanalysis, not a raingauge: ${mm(past.rain14)} across ${past.days} days${past.through ? ` through ${past.through}` : ""}.`
+      : past.source === "ifs" && past.rain14 != null
+        ? `Dryness is ${mm(past.rain14)} from IFS over the last fortnight, because reanalysis did not load. Not a raingauge.`
+        : "Dryness is a neutral guess, because recent rain was missing."
   const fireDetail =
     ffdiValue == null
       ? "Not enough temperature, humidity and wind to score fire weather."
-      : `${fireCat} on an unofficial McArthur index for ${fireDay?.weekday ?? "the afternoon"} 3pm — ${Math.round(fireTemp ?? 0)}°, humidity ${Math.round(fireRh ?? 0)}%, wind ${Math.round(fireWind ?? 0)} km/h. Dryness is ${dry.known ? `${mm(rain14)} over the last fortnight` : "a neutral guess, because recent rain was missing"}. This is not an AFDRS rating and not a permit to burn.`
+      : `${fireCat} on an unofficial McArthur index for ${fireDay?.weekday ?? "the afternoon"} 3pm — ${Math.round(fireTemp ?? 0)}°, humidity ${Math.round(fireRh ?? 0)}%, wind ${Math.round(fireWind ?? 0)} km/h. ${dryness} This is not an AFDRS rating and not a permit to burn.`
 
   const airRaw = airBody as { current?: Record<string, number | null> } | null
   const air = airRaw?.current
@@ -567,7 +582,7 @@ function assemble(
       ? "Today"
       : peakDay?.date === dates[1]
         ? "Tomorrow"
-        : (weekdayOf(peakDay?.date ?? stamp.dateKey).long)
+        : weekdayOf(peakDay?.date ?? stamp.dateKey).long
 
   let ahead = 0
   for (const hour of hourlyOut) {
@@ -584,6 +599,8 @@ function assemble(
     ridge,
     temp: nowTemp,
     mean: nowMean,
+    centre: centreTemp,
+    centres: centreCount,
     lo,
     hi,
     live: active.length,
@@ -596,30 +613,29 @@ function assemble(
     ensembleNames,
     ahead,
     outlier: today?.outlier ?? null,
-    stormLabel: stormLabel(peakDay?.storm ?? 0),
-    stormScore: peakDay?.storm ?? 0,
     stormDay: dayName,
+    stormPop: peakDay?.pop ?? null,
     seaBreeze: peakDay?.seaBreeze ?? false,
-    cape: peakDay ? afternoonCape(times, peakDay.date, blend) : null,
+    cape: peakDay?.cape ?? null,
+    gust: peakDay?.gust ?? null,
     spread: spreadDay?.spread ?? null,
     spreadWhen,
   })
 
-  const capeNow = peakDay ? afternoonCape(times, peakDay.date, blend) : null
   const stormDetail = peakDay
-    ? `${dayName} has the highest storm score in the next five days (${stormLabel(peakDay.storm).toLowerCase()}, ${peakDay.storm}). The score is only median CAPE${capeNow != null ? ` near ${Math.round(capeNow)} J/kg` : ""}, the equal-vote rain chance, and median gusts. ${
+    ? `${dayName} is the highest afternoon CAPE in the next five days. The three numbers are that CAPE, the ensemble chance of at least 1 mm, and the median gust. ${
         peakDay.seaBreeze
-          ? "The afternoon wind is onshore. That fact is shown and is not applied as a penalty."
-          : "The afternoon wind is not a sustained onshore breeze."
+          ? "The afternoon wind is onshore. That is reported, and it is not a penalty."
+          : "The afternoon wind is not a sustained onshore flow."
       }`
-    : ""
+    : "No afternoon in the next five days."
 
   const uvLeft = hourlyOut.reduce<number | null>((best, hour) => {
     if (hour.uv == null) return best
     return best == null ? hour.uv : Math.max(best, hour.uv)
   }, null)
 
-  return {
+  const forecast: Forecast = {
     placeName: place.name,
     admin: place.admin ?? "NSW",
     elevation: Math.round(place.elevation),
@@ -628,6 +644,10 @@ function assemble(
     gradient: gradientText(place.name, ridge, anchors),
     condition: conditionLabel(majorityCode(nowI)),
     cluster: gap >= 4 ? "Wide split" : gap >= 2 ? "Some spread" : "Tight cluster",
+    centreTemp,
+    centreCount,
+    runs,
+    hourlyFrom,
     now: {
       temp: nowTemp,
       mean: nowMean,
@@ -649,11 +669,14 @@ function assemble(
     days,
     fan,
     anchors,
+    observations,
+    obsNote,
+    scorecard: null,
     storm: {
-      score: peakDay?.storm ?? 0,
-      label: stormLabel(peakDay?.storm ?? 0),
       day: dayName,
-      cape: peakDay ? afternoonCape(times, peakDay.date, blend) : null,
+      cape: peakDay?.cape ?? null,
+      pop: peakDay?.pop ?? null,
+      gust: peakDay?.gust ?? null,
       seaBreeze: peakDay?.seaBreeze ?? false,
       detail: stormDetail,
     },
@@ -666,6 +689,7 @@ function assemble(
     ensembles: ensembleIds.length,
     ensembleNames,
   }
+  return { forecast, issued }
 }
 
 function silentNote(missing: string[]): string | null {
@@ -689,52 +713,64 @@ function stringAt(
   return null
 }
 
-function afternoonCape(
-  times: string[],
-  date: string,
-  blend: (name: string, index: number) => number | null,
-): number | null {
-  let peak: number | null = null
-  for (const i of hoursMatching(times, date, 12, 19)) {
-    const c = blend("cape", i)
-    if (c != null) peak = peak == null ? c : Math.max(peak, c)
+function cacheKey(place: Place): string {
+  return `v8:${place.latitude.toFixed(3)},${place.longitude.toFixed(3)},${Math.round(place.elevation)}`
+}
+
+function placeKeyOf(place: Place): string {
+  return `${place.latitude.toFixed(3)},${place.longitude.toFixed(3)}`
+}
+
+function shiftDate(dateKey: string, days: number): string {
+  const dt = new Date(`${dateKey}T12:00:00Z`)
+  dt.setUTCDate(dt.getUTCDate() + days)
+  return dt.toISOString().slice(0, 10)
+}
+
+function rainSeries(block: Block | undefined): Num[] | null {
+  if (!block) return null
+  const direct = nums(block, "precipitation_sum")
+  if (direct?.some((v) => v != null)) return direct
+  const key = Object.keys(block).find((k) => k.startsWith("precipitation_sum"))
+  return key ? nums(block, key) : null
+}
+
+function sumRain(body: unknown, beforeDate: string): { rain14: number; days: number; through: string | null } | null {
+  const daily = (body as { daily?: Block } | null)?.daily
+  const times = daily?.time ?? []
+  const rain = rainSeries(daily)
+  if (!rain) return null
+  let sum = 0
+  let days = 0
+  let through: string | null = null
+  times.forEach((date, i) => {
+    if (date >= beforeDate) return
+    const v = rain[i]
+    if (v == null) return
+    sum += v
+    days += 1
+    if (!through || date > through) through = date
+  })
+  if (!days) return null
+  return { rain14: sum, days, through }
+}
+
+async function fortnightRain(place: Place): Promise<PastRain> {
+  const today = sydneyStamp().dateKey
+  const archiveUrl = new URL("https://archive-api.open-meteo.com/v1/archive")
+  archiveUrl.searchParams.set("latitude", String(place.latitude))
+  archiveUrl.searchParams.set("longitude", String(place.longitude))
+  archiveUrl.searchParams.set("elevation", String(place.elevation))
+  archiveUrl.searchParams.set("start_date", shiftDate(today, -14))
+  archiveUrl.searchParams.set("end_date", shiftDate(today, -1))
+  archiveUrl.searchParams.set("daily", "precipitation_sum")
+  archiveUrl.searchParams.set("timezone", "Australia/Sydney")
+  try {
+    const summed = sumRain(await fetchJson(archiveUrl.toString()), today)
+    if (summed && summed.days >= 7) return { source: "era5", ...summed }
+  } catch {
+    // Reanalysis can lag or refuse a recent end date. IFS is the fallback.
   }
-  return peak
-}
-
-async function load(place: Place): Promise<ForecastResult> {
-  const key = `v5:${place.latitude.toFixed(3)},${place.longitude.toFixed(3)},${Math.round(place.elevation)}`
-  const hit = cache.get(key)
-  if (hit && Date.now() - hit.at < TTL) return hit.value
-  const pending = inflight.get(key)
-  if (pending) return pending
-  const job = loadFresh(place, key).finally(() => inflight.delete(key))
-  inflight.set(key, job)
-  return job
-}
-
-async function loadFresh(place: Place, key: string): Promise<ForecastResult> {
-  const spots = trioFor(place)
-  const forecastUrl = new URL("https://api.open-meteo.com/v1/forecast")
-  forecastUrl.searchParams.set("latitude", spots.map((s) => s.latitude).join(","))
-  forecastUrl.searchParams.set("longitude", spots.map((s) => s.longitude).join(","))
-  forecastUrl.searchParams.set("elevation", spots.map((s) => s.elevation).join(","))
-  forecastUrl.searchParams.set("hourly", HOURLY)
-  forecastUrl.searchParams.set("daily", DAILY)
-  forecastUrl.searchParams.set("models", MODEL_PARAM)
-  forecastUrl.searchParams.set("forecast_days", "10")
-  forecastUrl.searchParams.set("timezone", "Australia/Sydney")
-  forecastUrl.searchParams.set("wind_speed_unit", "kmh")
-
-  const ensUrl = new URL("https://ensemble-api.open-meteo.com/v1/ensemble")
-  ensUrl.searchParams.set("latitude", String(place.latitude))
-  ensUrl.searchParams.set("longitude", String(place.longitude))
-  ensUrl.searchParams.set("elevation", String(place.elevation))
-  ensUrl.searchParams.set("hourly", "precipitation")
-  ensUrl.searchParams.set("daily", "precipitation_sum,temperature_2m_max")
-  ensUrl.searchParams.set("models", ENSEMBLE_PARAM)
-  ensUrl.searchParams.set("forecast_days", "10")
-  ensUrl.searchParams.set("timezone", "Australia/Sydney")
 
   const pastUrl = new URL("https://api.open-meteo.com/v1/forecast")
   pastUrl.searchParams.set("latitude", String(place.latitude))
@@ -745,24 +781,177 @@ async function loadFresh(place: Place, key: string): Promise<ForecastResult> {
   pastUrl.searchParams.set("forecast_days", "1")
   pastUrl.searchParams.set("models", "ecmwf_ifs")
   pastUrl.searchParams.set("timezone", "Australia/Sydney")
-
-  const airUrl = new URL("https://air-quality-api.open-meteo.com/v1/air-quality")
-  airUrl.searchParams.set("latitude", String(place.latitude))
-  airUrl.searchParams.set("longitude", String(place.longitude))
-  airUrl.searchParams.set("current", "pm2_5,pm10,us_aqi")
-  airUrl.searchParams.set("timezone", "Australia/Sydney")
-
   try {
+    const summed = sumRain(await fetchJson(pastUrl.toString()), today)
+    if (summed) return { source: "ifs", ...summed }
+  } catch {
+    // Missing rain stays a neutral dryness guess inside the fire card.
+  }
+  return { rain14: null, source: "none", days: 0, through: null }
+}
+
+function cycleSlots(now = new Date()): string[] {
+  const t = new Date(now)
+  t.setUTCMinutes(0, 0, 0)
+  t.setUTCHours(t.getUTCHours() - (t.getUTCHours() % 6))
+  const slots: string[] = []
+  for (let i = 0; i < 6; i++) {
+    const y = t.getUTCFullYear()
+    const m = String(t.getUTCMonth() + 1).padStart(2, "0")
+    const d = String(t.getUTCDate()).padStart(2, "0")
+    const hh = String(t.getUTCHours()).padStart(2, "0")
+    slots.push(`${y}-${m}-${d}T${hh}:00`)
+    t.setUTCHours(t.getUTCHours() - 6)
+  }
+  return slots
+}
+
+async function probeRun(model: string, run: string, place: Place): Promise<boolean> {
+  const url = new URL("https://single-runs-api.open-meteo.com/v1/forecast")
+  url.searchParams.set("latitude", String(place.latitude))
+  url.searchParams.set("longitude", String(place.longitude))
+  url.searchParams.set("elevation", String(place.elevation))
+  url.searchParams.set("hourly", "temperature_2m")
+  url.searchParams.set("models", model)
+  url.searchParams.set("forecast_hours", "1")
+  url.searchParams.set("run", run)
+  url.searchParams.set("timezone", "UTC")
+  try {
+    const body = await fetchJson(url.toString())
+    return Boolean(asLocs(body)[0]?.hourly?.time?.length)
+  } catch {
+    return false
+  }
+}
+
+async function latestCycle(model: string, name: string, place: Place): Promise<ModelRun | null> {
+  for (const run of cycleSlots()) {
+    const ok = await probeRun(model, run, place)
+    if (!ok) continue
+    const started = Date.parse(`${run}Z`)
+    if (!Number.isFinite(started)) return null
+    const ageHours = Math.max(0, Math.round((Date.now() - started) / 3_600_000))
+    const hour = Number(run.slice(11, 13))
+    const day = Number(run.slice(8, 10))
+    const month = MONTHS[Number(run.slice(5, 7)) - 1] ?? ""
+    return { name, label: `${name} ${hour}z ${day} ${month}, ${ageHours} h old`, ageHours }
+  }
+  return null
+}
+
+function buildScorecard(
+  place: Place,
+  station: { id: string; name: string; distanceKm: number } | null,
+  hits: Array<{ hourKey: string; median: number | null; obs: number | null }> | null,
+): Scorecard | null {
+  if (!hits) return null
+  const rows = [...hits].reverse().map((hit) => {
+    const { weekday } = weekdayOf(hit.hourKey.slice(0, 10))
+    const error = hit.median != null && hit.obs != null ? hit.median - hit.obs : null
+    return {
+      hourKey: hit.hourKey,
+      label: `${weekday} ${hourLabel(hit.hourKey)}`,
+      median: hit.median,
+      obs: hit.obs,
+      error,
+    }
+  })
+  const errors = rows.map((row) => row.error).filter((v): v is number => v != null)
+  const mae = errors.length ? errors.reduce((sum, value) => sum + Math.abs(value), 0) / errors.length : null
+  const ridge = onTheRidge(place)
+  const note = !station
+    ? "No station temperature this run. The ledger still keeps the first median for each hour."
+    : ridge
+      ? `${station.name} (${station.id}) is ${station.distanceKm} km away. That station is not the ridge. Error is the median minus the station.`
+      : `${station.name} (${station.id}) is ${station.distanceKm} km away. Error is the median minus the station.`
+  return {
+    station: station?.name ?? "No station",
+    stationId: station?.id ?? "",
+    distanceKm: station?.distanceKm ?? null,
+    mae,
+    count: errors.length,
+    rows,
+    note,
+  }
+}
+
+async function load(place: Place): Promise<ForecastResult> {
+  const key = cacheKey(place)
+  const hit = cache.get(key)
+  if (hit && Date.now() - hit.at < TTL) return hit.value
+  const pending = inflight.get(key)
+  if (pending) return pending
+  const job = loadFresh(place, key).finally(() => inflight.delete(key))
+  inflight.set(key, job)
+  return job
+}
+
+async function loadFresh(place: Place, key: string): Promise<ForecastResult> {
+  try {
+    const { cachedForecast, storeForecast, scoreHours } = await import("./ledger")
+    const stored = await cachedForecast(key, TTL)
+    if (stored) {
+      cache.set(key, { at: stored.storedAt, value: stored.value })
+      return stored.value
+    }
+
+    const spots = trioFor(place)
+    const forecastUrl = new URL("https://api.open-meteo.com/v1/forecast")
+    forecastUrl.searchParams.set("latitude", spots.map((s) => s.latitude).join(","))
+    forecastUrl.searchParams.set("longitude", spots.map((s) => s.longitude).join(","))
+    forecastUrl.searchParams.set("elevation", spots.map((s) => s.elevation).join(","))
+    forecastUrl.searchParams.set("hourly", HOURLY)
+    forecastUrl.searchParams.set("daily", DAILY)
+    forecastUrl.searchParams.set("models", MODEL_PARAM)
+    forecastUrl.searchParams.set("forecast_days", "10")
+    forecastUrl.searchParams.set("timezone", "Australia/Sydney")
+    forecastUrl.searchParams.set("wind_speed_unit", "kmh")
+
+    const ensUrl = new URL("https://ensemble-api.open-meteo.com/v1/ensemble")
+    ensUrl.searchParams.set("latitude", String(place.latitude))
+    ensUrl.searchParams.set("longitude", String(place.longitude))
+    ensUrl.searchParams.set("elevation", String(place.elevation))
+    ensUrl.searchParams.set("hourly", "precipitation")
+    ensUrl.searchParams.set("daily", "precipitation_sum,temperature_2m_max")
+    ensUrl.searchParams.set("models", ENSEMBLE_PARAM)
+    ensUrl.searchParams.set("forecast_days", "10")
+    ensUrl.searchParams.set("timezone", "Australia/Sydney")
+
+    const airUrl = new URL("https://air-quality-api.open-meteo.com/v1/air-quality")
+    airUrl.searchParams.set("latitude", String(place.latitude))
+    airUrl.searchParams.set("longitude", String(place.longitude))
+    airUrl.searchParams.set("current", "pm2_5,pm10,us_aqi")
+    airUrl.searchParams.set("timezone", "Australia/Sydney")
+
     const forecast = await fetchJson(forecastUrl.toString())
     const ensemble = await fetchJson(ensUrl.toString()).catch(() => null)
-    const past = await fetchJson(pastUrl.toString()).catch(() => null)
+    const past = await fortnightRain(place)
     const air = await fetchJson(airUrl.toString()).catch(() => null)
-    const radar = await radarFor(place.latitude, place.longitude)
-    const value: ForecastResult = {
-      ok: true,
-      forecast: assemble(place, asLocs(forecast), ensemble, past, air, radar),
+    const [radar, ifsRun, accessRun, stations] = await Promise.all([
+      loadRadar(place.latitude, place.longitude),
+      latestCycle("ecmwf_ifs", "IFS", place),
+      latestCycle("bom_access_global", "ACCESS-G", place),
+      loadStations(place),
+    ])
+    const runs = [ifsRun, accessRun].filter((run): run is ModelRun => run != null)
+    const built = assemble(place, asLocs(forecast), ensemble, past, air, radar, runs, stations.cards, stations.note)
+    const hits = await scoreHours({
+      placeKey: placeKeyOf(place),
+      nowHour: sydneyStamp().hourKey,
+      station: stations.score?.id ?? null,
+      obs: stations.score?.byHour ?? null,
+      hours: built.issued,
+    })
+    built.forecast.scorecard = buildScorecard(
+      place,
+      stations.score ? { id: stations.score.id, name: stations.score.name, distanceKm: stations.score.distanceKm } : null,
+      hits,
+    )
+    const value: ForecastResult = { ok: true, forecast: built.forecast }
+    if (radar.ranges.length > 0) {
+      cache.set(key, { at: Date.now(), value })
+      await storeForecast(key, value)
     }
-    cache.set(key, { at: Date.now(), value })
     return value
   } catch (error) {
     const message = error instanceof Error ? error.message : "The forecast could not be loaded."

@@ -60,7 +60,7 @@ export type DayPoint = {
   summary: string
   outlier: string | null
   models: DayModel[]
-  storm: number
+  cape: number | null
   seaBreeze: boolean
 }
 
@@ -85,8 +85,60 @@ export type AnchorCard = {
 
 export type RadarFrame = {
   label: string
-  radar: string[]
-  base: string[]
+  src: string
+}
+
+export type RadarRange = {
+  km: number
+  code: string
+  pinLeft: number | null
+  pinTop: number | null
+  map: string
+  rings: string
+  loop: string
+  frames: RadarFrame[]
+}
+
+export type RadarView = {
+  site: string
+  clutter: boolean
+  ranges: RadarRange[]
+}
+
+export type StationObs = {
+  role: string
+  name: string
+  id: string
+  elevation: number | null
+  distanceKm: number | null
+  temp: number | null
+  change: number | null
+  windText: string | null
+  when: string
+}
+
+export type ModelRun = {
+  name: string
+  label: string
+  ageHours: number
+}
+
+export type ScoreRow = {
+  hourKey: string
+  label: string
+  median: number | null
+  obs: number | null
+  error: number | null
+}
+
+export type Scorecard = {
+  station: string
+  stationId: string
+  distanceKm: number | null
+  mae: number | null
+  count: number
+  rows: ScoreRow[]
+  note: string
 }
 
 export type Forecast = {
@@ -98,6 +150,10 @@ export type Forecast = {
   gradient: string
   condition: string
   cluster: string
+  centreTemp: number | null
+  centreCount: number
+  runs: ModelRun[]
+  hourlyFrom: "ensemble" | "models"
   now: {
     temp: number | null
     mean: number | null
@@ -119,11 +175,14 @@ export type Forecast = {
   days: DayPoint[]
   fan: FanPoint[]
   anchors: AnchorCard[]
+  observations: StationObs[]
+  obsNote: string | null
+  scorecard: Scorecard | null
   storm: {
-    score: number
-    label: string
     day: string
     cape: number | null
+    pop: number | null
+    gust: number | null
     seaBreeze: boolean
     detail: string
   }
@@ -138,11 +197,7 @@ export type Forecast = {
     aqi: number | null
     label: string
   } | null
-  radar: {
-    frames: RadarFrame[]
-    pinLeft: number
-    pinTop: number
-  }
+  radar: RadarView
   accessNote: string | null
   liveModels: number
   askedModels: number
